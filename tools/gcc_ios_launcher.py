@@ -132,6 +132,19 @@ try:
     with open(temp_s, 'r', encoding='utf-8', errors='replace') as f:
         lines = f.readlines()
 
+    # GCC 15+ emits binary data as `.base64 "..."`, which Clang's assembler does not know.
+    import base64 as _b64
+    expanded = []
+    for l in lines:
+        st = l.strip()
+        if st.startswith('.base64'):
+            data = _b64.b64decode(st[len('.base64'):].strip().strip('"'))
+            for i in range(0, len(data), 32):
+                expanded.append('\t.byte ' + ','.join(str(b) for b in data[i:i + 32]) + '\n')
+        else:
+            expanded.append(l)
+    lines = expanded
+
     new_lines = []
     defined_labels = {l.strip()[:-1] for l in lines if l.strip().endswith(':')}
     local_syms = set()

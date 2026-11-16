@@ -2,6 +2,9 @@
 #include "launcher.h"
 #include "textures.h"
 #include "widescreen.h"
+extern "C" {
+#include "touch.h"
+}
 #include "launcher_data.hpp"
 #include "discfont.h"
 #include "version.hpp"
@@ -1292,6 +1295,22 @@ public:
 extern "C" void pc_launcher_configure(AuroraConfig* config) {
     config_path = std::filesystem::path(config->userPath ? config->userPath : ".") / "launcher.cfg";
     prefs = launcher::load_preferences(config_path);
+#if defined(TARGET_OS_IPHONE) && TARGET_OS_IPHONE || defined(__ANDROID__)
+    {
+        // blz (Markus 15 Nov 2026): phones play 16:9 full screen by default; set once, so a
+        // later change in the in-game menu sticks.
+        const auto marker = config_path.parent_path() / "blz-phone-defaults";
+        std::error_code ec;
+        if (!std::filesystem::exists(marker, ec)) {
+            prefs.widescreen = 1;
+            prefs.fullscreen = true;
+            std::string error;
+            launcher::save_preferences(config_path, prefs, error);
+            if (FILE* f = fopen(marker.string().c_str(), "w"))
+                fclose(f);
+        }
+    }
+#endif
     pc_net_set_input_delay(prefs.net_delay);
     if (prefs.install_id == 0) {
         prefs.install_id = std::random_device{}() | uint64_t(std::random_device{}()) << 32 | 1;
@@ -1398,6 +1417,42 @@ extern "C" int pc_launcher_run(const char* command_line_disc, SDL_Window* window
     try {
         std::string error;
         bool start_requested = false;
+        // blz (Markus 15 Nov 2026: games boot straight into the game): with no disc on the command
+        // line, use the saved disc or find one by itself (Documents, then inside the app), and start
+        // it at once - the launcher only shows when no disc is found.
+        std::string blz_disc;
+        if (!command_line_disc) {
+            if (!prefs.disc.empty() && launcher::inspect_disc(prefs.disc).supported) {
+                blz_disc = prefs.disc;
+            } else {
+                std::vector<std::filesystem::path> dirs;
+                if (const char* home = getenv("HOME"))
+                    dirs.emplace_back(std::filesystem::path(home) / "Documents");
+                if (const char* base = SDL_GetBasePath())
+                    dirs.emplace_back(base);
+                dirs.emplace_back(config_path.parent_path());
+                for (const auto& dir : dirs) {
+                    std::error_code ec;
+                    if (!blz_disc.empty() || !std::filesystem::is_directory(dir, ec))
+                        continue;
+                    for (const auto& e : std::filesystem::directory_iterator(dir, ec)) {
+                        std::string ext = e.path().extension().string();
+                        for (auto& c : ext)
+                            c = (char)tolower((unsigned char)c);
+                        if (ext != ".iso" && ext != ".gcm" && ext != ".ciso" && ext != ".rvz")
+                            continue;
+                        if (launcher::inspect_disc(e.path().string()).supported) {
+                            blz_disc = e.path().string();
+                            break;
+                        }
+                    }
+                }
+            }
+            if (!blz_disc.empty()) {
+                SDL_Log("blz: starting the disc by itself: %s", blz_disc.c_str());
+                command_line_disc = blz_disc.c_str();
+            }
+        }
         if (command_line_disc) {
             auto info = launcher::inspect_disc(command_line_disc);
             if (info.supported && aurora_dvd_open(command_line_disc)) {
@@ -2259,6 +2314,55 @@ PortMenu port_menu;
 extern "C" bool pc_menu_is_open(void) {
     return port_menu.open;
 }
+#if defined(TARGET_OS_IPHONE) && TARGET_OS_IPHONE
+// blz (Markus 15 Nov 2026): drawn touch controls on iPhone, from touch.c's own hit table.
+static Rml::ElementDocument* blz_touch_doc = nullptr;
+static void blz_place(Rml::Element* e, float cx, float cy, float r, float w, float h) {
+    const float d = 2.0f * r * h;
+    e->SetProperty("left", std::to_string(int(cx * w - d / 2)) + "px");
+    e->SetProperty("top", std::to_string(int(cy * h - d / 2)) + "px");
+    e->SetProperty("width", std::to_string(int(d)) + "px");
+    e->SetProperty("height", std::to_string(int(d)) + "px");
+    e->SetProperty("line-height", std::to_string(int(d)) + "px");
+    e->SetProperty("border-radius", std::to_string(int(d / 2)) + "px");
+    e->SetProperty("font-size", std::to_string(int(d * (r < 0.06f ? 0.28f : 0.42f))) + "px");
+}
+static void blz_touch_update() {
+    if (!blz_touch_doc)
+        return;
+    if (port_menu.open) {
+        if (blz_touch_doc->IsVisible())
+            blz_touch_doc->Hide();
+        return;
+    }
+    if (!blz_touch_doc->IsVisible())
+        blz_touch_doc->Show(Rml::ModalFlag::None, Rml::FocusFlag::None);
+    const auto dims = blz_touch_doc->GetContext()->GetDimensions();
+    const float w = float(dims.x), h = float(dims.y);
+    if (w <= 0 || h <= 0)
+        return;
+    const PcTouchButton* layout = nullptr;
+    const int n = pc_touch_layout(&layout);
+    const uint16_t held = pc_touch_held_buttons();
+    for (int i = 0; i < n; i++) {
+        if (auto* e = blz_touch_doc->GetElementById(layout[i].label)) {
+            blz_place(e, layout[i].x, layout[i].y, layout[i].r, w, h);
+            e->SetClass("down", (held & layout[i].button) != 0);
+        }
+    }
+    float ox = 0.17f, oy = 0.68f;
+    const bool active = pc_touch_stick_origin(&ox, &oy);
+    PADStatus st{};
+    pc_touch_get_status_peek(&st);
+    if (auto* e = blz_touch_doc->GetElementById("stick"))
+        blz_place(e, ox, oy, 0.15f, w, h);
+    if (auto* e = blz_touch_doc->GetElementById("knob")) {
+        const float kx = active ? ox + (st.stickX / 80.0f) * 0.12f * h / w : ox;
+        const float ky = active ? oy - (st.stickY / 80.0f) * 0.12f : oy;
+        blz_place(e, kx, ky, 0.07f, w, h);
+    }
+}
+#endif
 extern "C" void pc_menu_init(SDL_Window* window) {
     pc_widescreen_set_mode(prefs.widescreen);
     VISetFrameBufferScale(prefs.render_scale);
@@ -2279,6 +2383,20 @@ extern "C" void pc_menu_init(SDL_Window* window) {
     port_menu.window = window;
     port_menu.document = context->LoadDocument((resources / "port-menu.rml").string());
     port_menu.counter = context->LoadDocument((resources / "fps.rml").string());
+#if defined(TARGET_OS_IPHONE) && TARGET_OS_IPHONE
+    blz_touch_doc = context->LoadDocument((resources / "touch.rml").string());
+    if (blz_touch_doc) {
+        const PcTouchButton* layout = nullptr;
+        const int n = pc_touch_layout(&layout);
+        for (int i = 0; i < n; i++) {
+            auto el = blz_touch_doc->CreateElement("div");
+            el->SetId(layout[i].label);
+            el->SetClass("b", true);
+            el->SetInnerRML(layout[i].label);
+            blz_touch_doc->AppendChild(std::move(el));
+        }
+    }
+#endif
     if (!port_menu.document) {
         SDL_Log("F1 menu: could not load port-menu.rml");
         return;
@@ -2298,6 +2416,9 @@ extern "C" void pc_menu_event(const SDL_Event* event) {
         port_menu.gamepad(*event);
 }
 extern "C" void pc_menu_update(void) {
+#if defined(TARGET_OS_IPHONE) && TARGET_OS_IPHONE
+    blz_touch_update();
+#endif
     if (port_menu.counter) {
         if (prefs.fps) {
             if (!port_menu.counter->IsVisible())
